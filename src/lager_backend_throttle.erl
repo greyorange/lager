@@ -65,11 +65,13 @@ handle_event({log, _Message},State) ->
         {true, _, true} ->
             %% need to flip to sync mode
             ?TOGGLE_SYNC(),
+            prometheus_gauge:set(lager_sync_mode_boolean, [State#state.sink], 1),
             lager_config:set({State#state.sink, async}, false),
             {ok, State#state{async=false}};
         {_, true, false} ->
             %% need to flip to async mode
             ?TOGGLE_ASYNC(),
+            prometheus_gauge:set(lager_sync_mode_boolean, [State#state.sink], 0),
             lager_config:set({State#state.sink, async}, true),
             {ok, State#state{async=true}};
         _ ->

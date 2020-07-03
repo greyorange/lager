@@ -510,7 +510,7 @@ check_hwm(Shaper = #lager_shaper{mps = Mps, hwm = Hwm, lasttime = Last}) when Mp
             %different second - reset mps
             {true, 0, Shaper#lager_shaper{mps=1, lasttime = Now}}
     end;
-check_hwm(Shaper = #lager_shaper{lasttime = Last, dropped = Drop}) ->
+check_hwm(Shaper = #lager_shaper{id = ShaperId, hwm = Hwm, mps = Mps, lasttime = Last, dropped = Drop}) ->
     %% are we still in the same second?
     {M, S, _} = Now = os:timestamp(),
     case Last of
@@ -530,6 +530,19 @@ check_hwm(Shaper = #lager_shaper{lasttime = Last, dropped = Drop}) ->
                     end,
             {false, 0, Shaper#lager_shaper{dropped=Drop+NewDrops, timer=Timer}};
         _ ->
+            prometheus_gauge:set(lager_messages_per_second, [ShaperId], Mps),
+            prometheus_counter:inc(lager_dropped_messages_total, [ShaperId], Drop),
+            {_, QueueLength} = process_info(self(), message_queue_len),
+            prometheus_gauge:set(lager_sink_message_queue_length, [ShaperId, Hwm], QueueLength),
+            CounterEvents =
+                case erlang:whereis(gr_lager_default_tracer_counters) of
+                    undefined ->
+                        0;
+                    Pid1 ->
+                        {_, MsgLen} = erlang:process_info(Pid1, message_queue_len),
+                        MsgLen
+                end,
+            prometheus_gauge:set(goldrush_lager_tracer_message_queue_length, CounterEvents),
             _ = erlang:cancel_timer(Shaper#lager_shaper.timer),
             %% different second, reset all counters and allow it
             {true, Drop, Shaper#lager_shaper{dropped = 0, mps=0, lasttime = Now}}
