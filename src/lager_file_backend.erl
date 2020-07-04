@@ -197,6 +197,7 @@ handle_info({rotate, File}, #state{name=File, count=Count, date=Date, rotator=Ro
     schedule_rotation(File, Date),
     {ok, State1};
 handle_info({shaper_expired, Name}, #state{shaper=Shaper, name=Name, formatter=Formatter, formatter_config=FormatConfig} = State) ->
+    lager_util:log_prometheus_metrics(Shaper#lager_shaper{mps=0}),
     _ = case Shaper#lager_shaper.dropped of
             0 ->
                 ok;

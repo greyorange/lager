@@ -34,6 +34,7 @@ start_link() ->
 init([]) ->
     %% set up the config, is safe even during relups
     lager_config:new(),
+    init_metrics(),
     %% TODO:
     %% Always start lager_event as the default and make sure that
     %% other gen_event stuff can start up as needed
@@ -90,3 +91,81 @@ decide_crash_log(File) ->
     [{lager_crash_log, {lager_crash_log, start_link, [File, MaxBytes,
                                                       RotationSize, RotationDate, RotationCount, RotationMod]},
       permanent, 5000, worker, [lager_crash_log]}].
+
+init_metrics() ->
+    application:ensure_all_started(prometheus),
+    Metrics =
+        [
+          {
+            counter,
+              [
+                {name, lager_dropped_messages_total},
+                {help, "dropped messages in lager"},
+                {labels, [shaper_id]}
+              ]
+          },
+          {
+            gauge,
+              [
+                {name, lager_messages_per_second},
+                {help, "lager messages per second per sink"},
+                {labels, [shaper_id]}
+              ]
+          },
+          {
+            gauge,
+              [
+                {name, lager_hwm},
+                {help, "lager high water mark limit"},
+                {labels, [shaper_id]}
+              ]
+          },
+          {
+            gauge,
+              [
+                {name, lager_sync_mode_boolean},
+                {help, "boolean metric for lager's sink going into sync mode"},
+                {labels, [sink_name]}
+              ]
+          },
+          {
+            gauge,
+              [
+                {name, lager_sink_message_queue_length},
+                {help, "boolean metric for lager's sink going into sync mode"},
+                {labels, [shaper_id]}
+              ]
+          },
+          {
+            gauge,
+              [
+                {name, goldrush_lager_tracer_message_queue_length},
+                {help, "message queue length of the process reponsible for managing lager tracing"},
+                {labels, []}
+              ]
+          }
+        ],
+    lists:foreach(fun declare_metric/1, Metrics).
+
+%% TODO: Remove these from here once
+declare_metric({Metric, Spec}) ->
+  declare_metric(Metric, Spec);
+declare_metric({Registry, Metric, Spec}) ->
+  declare_metric(Metric, [{registry, Registry}] ++ Spec).
+
+declare_metric(Metric, Spec) ->
+  Module = type_to_module(Metric),
+  Module:declare(Spec).
+
+type_to_module(counter) ->
+  prometheus_counter;
+type_to_module(gauge) ->
+  prometheus_gauge;
+type_to_module(summary) ->
+  prometheus_summary;
+type_to_module(histogram) ->
+  prometheus_histogram;
+type_to_module(boolean) ->
+  prometheus_boolean;
+type_to_module(Type) ->
+  Type.
