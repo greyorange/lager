@@ -195,23 +195,7 @@ handle_info({rotate, File}, #state{name=File,count=Count,date=Date,rotator=Rotat
     schedule_rotation(File, Date),
     {ok, State1};
 handle_info({shaper_expired, Name}, #state{shaper=Shaper, name=Name, formatter=Formatter, formatter_config=FormatConfig} = State) ->
-    ShaperId = Shaper#lager_shaper.id,
-    Mps = Shaper#lager_shaper.mps,
-    Drop = Shaper#lager_shaper.dropped,
-    Hwm = Shaper#lager_shaper.hwm,
-    prometheus_gauge:set(lager_messages_per_second, [ShaperId], Mps),
-    prometheus_counter:inc(lager_dropped_messages_total, [ShaperId], Drop),
-    {_, QueueLength} = process_info(self(), message_queue_len),
-    prometheus_gauge:set(lager_sink_message_queue_length, [ShaperId, Hwm], QueueLength),
-    CounterEvents =
-        case erlang:whereis(gr_lager_default_tracer_counters) of
-            undefined ->
-                0;
-            Pid1 ->
-                {_, MsgLen} = erlang:process_info(Pid1, message_queue_len),
-                MsgLen
-        end,
-    prometheus_gauge:set(goldrush_lager_tracer_message_queue_length, CounterEvents),
+    lager_util:log_prometheus_metrics(Shaper#lager_shaper{mps=0}),
     _ = case Shaper#lager_shaper.dropped of
             0 ->
                 ok;

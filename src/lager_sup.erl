@@ -101,7 +101,7 @@ init_metrics() ->
               [
                 {name, lager_dropped_messages_total},
                 {help, "dropped messages in lager"},
-                {labels, [sink_name]}
+                {labels, [shaper_id]}
               ]
           },
           {
@@ -109,7 +109,15 @@ init_metrics() ->
               [
                 {name, lager_messages_per_second},
                 {help, "lager messages per second per sink"},
-                {labels, [sink_name, hwm]}
+                {labels, [shaper_id]}
+              ]
+          },
+          {
+            gauge,
+              [
+                {name, lager_hwm},
+                {help, "lager high water mark limit"},
+                {labels, [shaper_id]}
               ]
           },
           {
@@ -125,7 +133,15 @@ init_metrics() ->
               [
                 {name, lager_sink_message_queue_length},
                 {help, "boolean metric for lager's sink going into sync mode"},
-                {labels, [sink_name]}
+                {labels, [shaper_id]}
+              ]
+          },
+          {
+            gauge,
+              [
+                {name, goldrush_lager_tracer_message_queue_length},
+                {help, "message queue length of the process reponsible for managing lager tracing"},
+                {labels, []}
               ]
           }
         ],

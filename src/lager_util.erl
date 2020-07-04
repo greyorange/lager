@@ -27,7 +27,7 @@
     localtime_ms/0, localtime_ms/1, maybe_utc/1, parse_rotation_date_spec/1,
     calculate_next_rotation/1, validate_trace/1, check_traces/4, is_loggable/3,
     trace_filter/1, trace_filter/2, expand_path/1, find_file/2, check_hwm/1, check_hwm/2,
-    make_internal_sink_name/1, otp_version/0, maybe_flush/2
+    make_internal_sink_name/1, otp_version/0, maybe_flush/2, log_prometheus_metrics/1
 ]).
 
 -ifdef(TEST).
@@ -499,18 +499,24 @@ check_hwm(Shaper = #lager_shaper{filter = Filter}, Event) ->
 
 %% Log rate limit, i.e. high water mark for incoming messages
 
-check_hwm(Shaper = #lager_shaper{hwm = undefined}) ->
-    {true, 0, Shaper};
+check_hwm(Shaper = #lager_shaper{hwm = undefined, lasttime = Last}) ->
+    {M, S, _} = Now = os:timestamp(),
+    case Last of
+        {M, S, _} -> {true, 0, Shaper};
+        _ -> log_prometheus_metrics(Shaper),
+        {true, 0, Shaper#lager_shaper{lasttime = Now}}
+    end;
 check_hwm(Shaper = #lager_shaper{mps = Mps, hwm = Hwm, lasttime = Last}) when Mps < Hwm ->
     {M, S, _} = Now = os:timestamp(),
     case Last of
         {M, S, _} ->
             {true, 0, Shaper#lager_shaper{mps=Mps+1}};
         _ ->
+            log_prometheus_metrics(Shaper),
             %different second - reset mps
             {true, 0, Shaper#lager_shaper{mps=1, lasttime = Now}}
     end;
-check_hwm(Shaper = #lager_shaper{id = ShaperId, hwm = Hwm, mps = Mps, lasttime = Last, dropped = Drop}) ->
+check_hwm(Shaper = #lager_shaper{lasttime = Last, dropped = Drop}) ->
     %% are we still in the same second?
     {M, S, _} = Now = os:timestamp(),
     case Last of
@@ -530,23 +536,27 @@ check_hwm(Shaper = #lager_shaper{id = ShaperId, hwm = Hwm, mps = Mps, lasttime =
                     end,
             {false, 0, Shaper#lager_shaper{dropped=Drop+NewDrops, timer=Timer}};
         _ ->
-            prometheus_gauge:set(lager_messages_per_second, [ShaperId], Mps),
-            prometheus_counter:inc(lager_dropped_messages_total, [ShaperId], Drop),
-            {_, QueueLength} = process_info(self(), message_queue_len),
-            prometheus_gauge:set(lager_sink_message_queue_length, [ShaperId, Hwm], QueueLength),
-            CounterEvents =
-                case erlang:whereis(gr_lager_default_tracer_counters) of
-                    undefined ->
-                        0;
-                    Pid1 ->
-                        {_, MsgLen} = erlang:process_info(Pid1, message_queue_len),
-                        MsgLen
-                end,
-            prometheus_gauge:set(goldrush_lager_tracer_message_queue_length, CounterEvents),
+            log_prometheus_metrics(Shaper),
             _ = erlang:cancel_timer(Shaper#lager_shaper.timer),
             %% different second, reset all counters and allow it
             {true, Drop, Shaper#lager_shaper{dropped = 0, mps=0, lasttime = Now}}
     end.
+
+log_prometheus_metrics(#lager_shaper{id = ShaperId, hwm = Hwm, mps = Mps, dropped = Drop}) ->
+    prometheus_gauge:set(lager_messages_per_second, [ShaperId], Mps),
+    prometheus_gauge:set(lager_hwm, [ShaperId], Hwm),
+    prometheus_counter:inc(lager_dropped_messages_total, [ShaperId], Drop),
+    {_, QueueLength} = process_info(self(), message_queue_len),
+    prometheus_gauge:set(lager_sink_message_queue_length, [ShaperId], QueueLength),
+    CounterEvents =
+        case erlang:whereis(gr_lager_default_tracer_counters) of
+            undefined ->
+                0;
+            Pid1 ->
+                {_, MsgLen} = erlang:process_info(Pid1, message_queue_len),
+                MsgLen
+        end,
+    prometheus_gauge:set(goldrush_lager_tracer_message_queue_length, CounterEvents).
 
 should_flush(#lager_shaper{flush_queue = true, flush_threshold = 0}) ->
     true;
