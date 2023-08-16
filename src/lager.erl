@@ -40,7 +40,7 @@
         get_loglevel/1, get_loglevel/2, set_loglevel/2, set_loglevel/3, set_loglevel/4, get_loglevels/1,
         update_loglevel_config/1, posix_error/1, set_loghwm/2, set_loghwm/3, set_loghwm/4,
         safe_format/3, safe_format_chop/3, unsafe_format/2, dispatch_log/5, dispatch_log/7, dispatch_log/9,
-        do_log/9, do_log/10, do_log_unsafe/10, pr/2, pr/3, pr_stacktrace/1, pr_stacktrace/2]).
+        do_log/9, do_log/10, do_log/11, do_log_unsafe/10, pr/2, pr/3, pr_stacktrace/1, pr_stacktrace/2]).
 
 -type log_level() :: none | debug | info | notice | warning | error | critical | alert | emergency.
 -type log_level_number() :: 0..7.
@@ -131,10 +131,13 @@ dispatch_log(Sink, Severity, Metadata, Format, Args, Size, Safety) when is_atom(
 
 %% @private Should only be called externally from code generated from the parse transform
 do_log(Severity, Metadata, Format, Args, Size, SeverityAsInt, LevelThreshold, TraceFilters, Sink, SinkPid) when is_atom(Severity) ->
-    FormatFun = fun() -> safe_format_chop(Format, Args, Size) end,
-    do_log_impl(Severity, Metadata, Format, Args, SeverityAsInt, LevelThreshold, TraceFilters, Sink, SinkPid, FormatFun).
+    do_log(Severity, Metadata, #{}, Format, Args, Size, SeverityAsInt, LevelThreshold, TraceFilters, Sink, SinkPid).
 
-do_log_impl(Severity, Metadata, Format, Args, SeverityAsInt, LevelThreshold, TraceFilters, Sink, SinkPid, FormatFun) ->
+do_log(Severity, Metadata, SubMeta, Format, Args, Size, SeverityAsInt, LevelThreshold, TraceFilters, Sink, SinkPid) when is_atom(Severity) ->
+    FormatFun = fun() -> safe_format_chop(Format, Args, Size) end,
+    do_log_impl(Severity, Metadata, SubMeta, Format, Args, SeverityAsInt, LevelThreshold, TraceFilters, Sink, SinkPid, FormatFun).
+
+do_log_impl(Severity, Metadata, SubMeta, Format, Args, SeverityAsInt, LevelThreshold, TraceFilters, Sink, SinkPid, FormatFun) ->
     {Destinations, TraceSinkPid} = case TraceFilters of
         [] ->
             {[], undefined};
@@ -149,8 +152,10 @@ do_log_impl(Severity, Metadata, Format, Args, SeverityAsInt, LevelThreshold, Tra
                 _ ->
                     Format
             end,
+            io:format("Metadata = ~p, SubMeta = ~p", [Metadata, SubMeta]),
+            Metadata0 = maps:to_list(SubMeta) ++ Metadata,
             LagerMsg = lager_msg:new(Msg,
-                Severity, Metadata, Destinations),
+                Severity, Metadata0, Destinations),
             case lager_config:get({Sink, async}, false) of
                 true ->
                     gen_event:notify(SinkPid, {log, LagerMsg});
@@ -176,7 +181,7 @@ do_log_impl(Severity, Metadata, Format, Args, SeverityAsInt, LevelThreshold, Tra
 %% Specifically, it would be level ++ `_unsafe' as in `info_unsafe'.
 do_log_unsafe(Severity, Metadata, Format, Args, _Size, SeverityAsInt, LevelThreshold, TraceFilters, Sink, SinkPid) when is_atom(Severity) ->
     FormatFun = fun() -> unsafe_format(Format, Args) end,
-    do_log_impl(Severity, Metadata, Format, Args, SeverityAsInt, LevelThreshold, TraceFilters, Sink, SinkPid, FormatFun).
+    do_log_impl(Severity, Metadata, #{}, Format, Args, SeverityAsInt, LevelThreshold, TraceFilters, Sink, SinkPid, FormatFun).
 
 
 %% backwards compatible with beams compiled with lager 1.x
@@ -189,7 +194,7 @@ dispatch_log(Severity, Metadata, Format, Args, Size) ->
 
 %% backwards compatible with beams compiled with lager 2.x
 do_log(Severity, Metadata, Format, Args, Size, SeverityAsInt, LevelThreshold, TraceFilters, SinkPid) ->
-    do_log(Severity, Metadata, Format, Args, Size, SeverityAsInt,
+    do_log(Severity, Metadata, #{}, Format, Args, Size, SeverityAsInt,
            LevelThreshold, TraceFilters, ?DEFAULT_SINK, SinkPid).
 
 
@@ -313,7 +318,7 @@ stop_trace({Backend, Filter, Level}) ->
 %% trace tuples differently than the way outside callers have
 %% the trace tuple.
 %%
-%% That is to say, outside they are represented as 
+%% That is to say, outside they are represented as
 %% `{Backend, Filter, Level}'
 %%
 %% and when they come back from validation, they're
@@ -589,12 +594,12 @@ pr(Record, _) ->
 
 %% @doc Print a record or a list of records lager found during parse transform
 pr(Record, Module, Options) when is_tuple(Record), is_atom(element(1, Record)), is_list(Options) ->
-    try 
+    try
         case is_record_known(Record, Module) of
             false ->
                 Record;
             {RecordName, RecordFields} ->
-                {'$lager_record', RecordName, 
+                {'$lager_record', RecordName,
                     zip(RecordFields, tl(tuple_to_list(Record)), Module, Options, [])}
         end
     catch
@@ -676,12 +681,12 @@ rotate_sink(Sink) ->
     Handlers = lager_config:global_get(handlers),
     RotateHandlers = lists:filtermap(
         fun({Handler,_,S}) when S == Sink -> {true, {Handler, Sink}};
-           (_)                            -> false 
-        end, 
+           (_)                            -> false
+        end,
         Handlers),
     rotate_handlers(RotateHandlers).
 
-rotate_all() -> 
+rotate_all() ->
     rotate_handlers(lists:map(fun({H,_,S}) -> {H, S} end,
                               lager_config:global_get(handlers))).
 

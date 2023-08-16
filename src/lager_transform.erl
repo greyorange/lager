@@ -170,7 +170,7 @@ do_transform(Line, SinkName, Severity, Arguments0, Safety) ->
                                                                     {atom, Line, App}]},
                                          {nil, Line}}, DefaultAttrs1)
                    end,
-    {Meta, Message, Arguments} = handle_args(DefaultAttrs, Line, Arguments0),
+    {Meta, SubMeta, Message, Arguments} = break_args(DefaultAttrs, Line, Arguments0),
     %% Generate some unique variable names so we don't accidentally export from case clauses.
     %% Note that these are not actual atoms, but the AST treats variable names as atoms.
     LevelVar = make_varname("__Level", Line),
@@ -188,7 +188,7 @@ do_transform(Line, SinkName, Severity, Arguments0, Safety) ->
     {'case',Line,
          {tuple,Line,
                 [{call,Line,{atom,Line,whereis},[{atom,Line,SinkName}]},
-                 {call,Line,{atom,Line,whereis},[{atom,Line,?DEFAULT_SINK}]}, 
+                 {call,Line,{atom,Line,whereis},[{atom,Line,?DEFAULT_SINK}]},
                  {call,Line,
                        {remote,Line,{atom,Line,lager_config},{atom,Line,get}},
                        [{tuple,Line,[{atom,Line,SinkName},{atom,Line,loglevel}]},
@@ -219,6 +219,7 @@ do_transform(Line, SinkName, Severity, Arguments0, Safety) ->
                   [{call,Line,{remote, Line, {atom, Line, lager}, {atom, Line, LogFun}},
                          [{atom,Line,Severity},
                           Meta,
+                          SubMeta,
                           Message,
                           Arguments,
                           {integer, Line, get(truncation_size)},
@@ -229,7 +230,14 @@ do_transform(Line, SinkName, Severity, Arguments0, Safety) ->
                           {var, Line, PidVar}]}]},
           %% _ -> ok
           {clause,Line,[{var,Line,'_'}],[],[{atom,Line,ok}]}]}.
- 
+
+break_args(DefaultAttrs, Line, [{map, _, _} = SubMeta | Args]) ->
+    {Meta, Message, Arguments} = handle_args(DefaultAttrs, Line, Args),
+    {Meta, SubMeta, Message, Arguments};
+break_args(DefaultAttrs, Line, Args) ->
+    {Meta, Message, Arguments} = handle_args(DefaultAttrs, Line, Args),
+    {Meta, {map, Line, []}, Message, Arguments}.
+
 handle_args(DefaultAttrs, Line, [{cons, LineNum, {tuple, _, _}, _} = Attrs]) ->
     {concat_lists(DefaultAttrs, Attrs), {string, LineNum, ""}, {atom, Line, none}};
 handle_args(DefaultAttrs, Line, [Format]) ->
