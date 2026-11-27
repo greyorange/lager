@@ -40,11 +40,17 @@
 -define(TOGGLE_ASYNC(), true).
 -endif.
 
+%% While the sink is in sync mode, how often to re-check the mailbox to see
+%% whether it has drained enough to return to async mode.
+-define(SYNC_RECHECK_MS, 1000).
+
 -record(state, {
         sink :: atom(),
         hwm :: non_neg_integer(),
         window_min :: non_neg_integer(),
-        async = true :: boolean()
+        async = true :: boolean(),
+        %% periodic self-check timer, armed only while in sync mode
+        recheck_timer = undefined :: reference() | undefined
     }).
 
 init([{sink, Sink}, Hwm, Window]) ->
@@ -68,13 +74,13 @@ handle_event({log, _Message},State) ->
             ?TOGGLE_SYNC(),
             prometheus_gauge:set(lager_sync_mode_boolean, [State#state.sink], 1),
             lager_config:set({State#state.sink, async}, false),
-            {ok, State#state{async=false}};
+            {ok, arm_recheck(State#state{async=false})};
         {_, true, false} ->
             %% need to flip to async mode
             ?TOGGLE_ASYNC(),
             prometheus_gauge:set(lager_sync_mode_boolean, [State#state.sink], 0),
             lager_config:set({State#state.sink, async}, true),
-            {ok, State#state{async=true}};
+            {ok, cancel_recheck(State#state{async=true})};
         _ ->
             %% nothing needs to change
             {ok, State}
@@ -82,16 +88,50 @@ handle_event({log, _Message},State) ->
 handle_event(_Event, State) ->
     {ok, State}.
 
+handle_info({timeout, TimerRef, sync_recheck}, #state{recheck_timer=TimerRef, async=false}=State) ->
+    %% While the sink is in sync mode new log events are dropped before they
+    %% reach it, so handle_event/2 may never run again to flip it back. Check
+    %% the mailbox here instead: once a backlog of non-log messages (for
+    %% example rotation timers) has drained, return to async mode.
+    {message_queue_len, Len} = erlang:process_info(self(), message_queue_len),
+    case Len < State#state.window_min of
+        true ->
+            ?TOGGLE_ASYNC(),
+            prometheus_gauge:set(lager_sync_mode_boolean, [State#state.sink], 0),
+            lager_config:set({State#state.sink, async}, true),
+            {ok, cancel_recheck(State#state{async=true})};
+        false ->
+            {ok, arm_recheck(State)}
+    end;
 handle_info(_Info, State) ->
     {ok, State}.
 
 %% @private
-terminate(_Reason, _State) ->
+terminate(_Reason, State) ->
+    _ = cancel_recheck(State),
     ok.
+
+%% Arm (or re-arm) the periodic self-check that returns the sink to async
+%% mode once its mailbox has drained. At most one such timer is pending.
+arm_recheck(State) ->
+    State1 = cancel_recheck(State),
+    TimerRef = erlang:start_timer(?SYNC_RECHECK_MS, self(), sync_recheck),
+    State1#state{recheck_timer=TimerRef}.
+
+cancel_recheck(#state{recheck_timer=undefined}=State) ->
+    State;
+cancel_recheck(#state{recheck_timer=TimerRef}=State) ->
+    _ = erlang:cancel_timer(TimerRef),
+    State#state{recheck_timer=undefined}.
 
 %% @private
 code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+    %% States from a version before recheck_timer was added are missing the
+    %% trailing field; append it.
+    case erlang:tuple_size(State) =:= erlang:tuple_size(#state{}) of
+        true -> {ok, State};
+        false -> {ok, erlang:append_element(State, undefined)}
+    end.
 
 -ifdef(TEST).
 test_get(Key) ->

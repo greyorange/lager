@@ -54,9 +54,15 @@ start() ->
     application:start(lager).
 
 start_throttle(Sink, Threshold, Window) ->
-    _ = supervisor:start_child(lager_handler_watcher_sup,
-                               [Sink, ?THROTTLE, [Threshold, Window]]),
-    ok.
+    case lists:member(?THROTTLE, existing_handler_ids(Sink)) of
+        true ->
+            ?INT_LOG(notice, "~p is already installed in sink ~p; not adding a second copy", [?THROTTLE, Sink]),
+            ok;
+        false ->
+            _ = supervisor:start_child(lager_handler_watcher_sup,
+                                       [Sink, ?THROTTLE, [Threshold, Window]]),
+            ok
+    end.
 
 determine_async_behavior(_Sink, undefined, _Window) ->
     ok;
@@ -80,17 +86,40 @@ start_handlers(_Sink, Handlers) when not is_list(Handlers) ->
       "Invalid value for 'handlers' (must be list): ~p~n", [Handlers]),
     throw({error, bad_config});
 start_handlers(Sink, Handlers) ->
+    %% Only install handler IDs that are not already present, so configuring
+    %% an existing sink again (for example by booting it a second time) does
+    %% not add a second copy of every handler. A sink that has no handlers
+    %% (for example one that was just restarted) still gets the full set.
+    Existing = existing_handler_ids(Sink),
     %% handlers failing to start are handled in the handler_watcher
     lager_config:global_set(handlers,
                             lager_config:global_get(handlers, []) ++
-                            lists:map(fun({Module, Config}) ->
+                            lists:filtermap(fun({Module, Config}) ->
                                               check_handler_config(Module, Config),
-                                              start_handler(Sink, Module, Config);
+                                              case lists:member(Module, Existing) of
+                                                  true ->
+                                                      ?INT_LOG(notice, "handler ~p is already installed in sink ~p; not adding a second copy", [Module, Sink]),
+                                                      false;
+                                                  false ->
+                                                      {true, start_handler(Sink, Module, Config)}
+                                              end;
                                           (_) ->
                                               throw({error, bad_config})
                                       end,
                                       expand_handlers(Handlers))),
     ok.
+
+%% @doc Return the IDs of the handlers currently installed in a sink.
+%%
+%% gen_event happily installs several handlers under the same id, so the
+%% result can contain duplicates. Used to make (re-)configuration of a sink
+%% idempotent; returns an empty list when the sink does not exist (yet).
+existing_handler_ids(Sink) ->
+    try gen_event:which_handlers(Sink) of
+        Ids -> Ids
+    catch
+        _:_ -> []
+    end.
 
 start_handler(Sink, Module, Config) ->
     {ok, Watcher} = supervisor:start_child(lager_handler_watcher_sup,
@@ -132,8 +161,15 @@ maybe_install_sink_killer(_Sink, undefined, _ReinstallTimer) -> ok;
 maybe_install_sink_killer(Sink, HWM, undefined) -> maybe_install_sink_killer(Sink, HWM, 5000);
 maybe_install_sink_killer(Sink, HWM, ReinstallTimer) when is_integer(HWM) andalso is_integer(ReinstallTimer)
                                                         andalso HWM >= 0 andalso ReinstallTimer >= 0 ->
-    _ = supervisor:start_child(lager_handler_watcher_sup, [Sink, lager_manager_killer,
-                                                           [HWM, ReinstallTimer]]);
+    case lists:member(lager_manager_killer, existing_handler_ids(Sink)) of
+        true ->
+            ?INT_LOG(notice, "lager_manager_killer is already installed in sink ~p; not adding a second copy", [Sink]),
+            ok;
+        false ->
+            _ = supervisor:start_child(lager_handler_watcher_sup, [Sink, lager_manager_killer,
+                                                                   [HWM, ReinstallTimer]]),
+            ok
+    end;
 maybe_install_sink_killer(_Sink, HWM, ReinstallTimer) ->
     error_logger:error_msg("Invalid value for 'killer_hwm': ~p or 'killer_reinstall_after': ~p", [HWM, ReinstallTimer]),
     throw({error, bad_config}).

@@ -78,7 +78,10 @@
         sync_interval = ?DEFAULT_SYNC_INTERVAL :: non_neg_integer(),
         sync_size = ?DEFAULT_SYNC_SIZE :: non_neg_integer(),
         last_check = os:timestamp() :: erlang:timestamp(),
-        os_type :: atom()
+        os_type :: atom(),
+        %% reference of the single rotation timer owned by this handler; the
+        %% timer only ever re-arms itself (see arm_rotation/2)
+        rotation_timer = undefined :: reference() | undefined
     }).
 
 -type option() :: {file, string()} | {level, lager:log_level()} |
@@ -119,11 +122,12 @@ init(LogFileConfig) when is_list(LogFileConfig) ->
               [proplists:get_value(Key, Config) || Key <- [file, level, date, size, count, rotator, high_water_mark, flush_queue, sync_interval, sync_size, sync_on, check_interval, formatter, formatter_config]],
             FlushThr = proplists:get_value(flush_threshold, Config, 0),
             Name = lager_util:expand_path(RelName),
-            schedule_rotation(Name, Date),
+            RotationTimer = arm_rotation(Name, Date),
             Shaper = lager_util:maybe_flush(Flush, #lager_shaper{hwm=HighWaterMark, flush_threshold = FlushThr, id=Name}),
             State0 = #state{name=Name, level=Level, size=Size, date=Date, count=Count, rotator=Rotator,
                 shaper=Shaper, formatter=Formatter, formatter_config=FormatterConfig,
-                sync_on=SyncOn, sync_interval=SyncInterval, sync_size=SyncSize, check_interval=CheckInterval},
+                sync_on=SyncOn, sync_interval=SyncInterval, sync_size=SyncSize, check_interval=CheckInterval,
+                rotation_timer=RotationTimer},
             State = case Rotator:create_logfile(Name, {SyncSize, SyncInterval}) of
                 {ok, {FD, Inode, Ctime, _Size}} ->
                     State0#state{fd=FD, inode=Inode, ctime=Ctime};
@@ -155,7 +159,8 @@ handle_call({set_loghwm, Hwm}, #state{shaper=Shaper, name=Name} = State) ->
             {ok, {last_loghwm, Shaper#lager_shaper.hwm}, State#state{shaper=NewShaper}}
     end;
 handle_call(rotate, State = #state{name=File}) ->
-    {ok, NewState} = handle_info({rotate, File}, State),
+    %% A manual rotation must not arm an extra timer; keep the existing one.
+    {ok, NewState} = rotate_and_maybe_arm(File, State),
     {ok, ok, NewState};
 handle_call(_Request, State) ->
     {ok, ok, State}.
@@ -191,11 +196,14 @@ handle_event(_Event, State) ->
     {ok, State}.
 
 %% @private
-handle_info({rotate, File}, #state{name=File, count=Count, date=Date, rotator=Rotator}=State0) ->
-    State1 = close_file(State0),
-    _ = Rotator:rotate_logfile(File, Count),
-    schedule_rotation(File, Date),
-    {ok, State1};
+handle_info({rotate, File}, #state{name=File}=State) ->
+    %% Legacy/external rotation trigger (a timer armed by an older version of
+    %% this module, or a message sent from outside). Rotate, and arm a timer
+    %% only if this handler has none: a handler must never own two timers.
+    rotate_and_maybe_arm(File, State);
+handle_info({timeout, TimerRef, {rotate, File}}, #state{name=File, rotation_timer=TimerRef}=State) ->
+    %% Our own rotation timer expired. Rotate and arm the next one.
+    rotate_and_arm(File, State);
 handle_info({shaper_expired, Name}, #state{shaper=Shaper, name=Name, formatter=Formatter, formatter_config=FormatConfig} = State) ->
     lager_util:log_prometheus_metrics(Shaper#lager_shaper{mps=0}),
     _ = case Shaper#lager_shaper.dropped of
@@ -215,13 +223,20 @@ handle_info(_Info, State) ->
 
 %% @private
 terminate(_Reason, State) ->
+    cancel_rotation(State#state.rotation_timer),
     %% leaving this function call unmatched makes dialyzer cranky
     _ = close_file(State),
     ok.
 
 %% @private
 code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+    %% States from a version before rotation_timer was added are missing the
+    %% trailing field; append it (a legacy timer, if any, re-arms itself on
+    %% expiry through the {rotate, File} clause above).
+    case erlang:tuple_size(State) =:= erlang:tuple_size(#state{}) of
+        true -> {ok, State};
+        false -> {ok, erlang:append_element(State, undefined)}
+    end.
 
 %% Convert the config into a gen_event handler ID
 config_to_id({Name,_Severity}) when is_list(Name) ->
@@ -464,11 +479,35 @@ validate_logfile_proplist([{flush_threshold, Thr}|Tail], Acc) ->
 validate_logfile_proplist([Other|_Tail], _Acc) ->
     throw({bad_config, "Invalid option", Other}).
 
-schedule_rotation(_, undefined) ->
+%% Arm the one rotation timer this handler owns, returning its reference (or
+%% undefined when rotation by date is disabled) so the caller can store it in
+%% the handler state. Using erlang:start_timer means expiry is delivered as
+%% {timeout, TimerRef, {rotate, Name}}, so a handler only ever reacts to and
+%% re-arms its own timer. Duplicate handlers of the same file each own their
+%% own timer, and the number of pending timers therefore stays constant
+%% instead of doubling on every rotation.
+arm_rotation(_, undefined) ->
+    undefined;
+arm_rotation(Name, Date) ->
+    erlang:start_timer(lager_util:calculate_next_rotation(Date) * 1000, self(), {rotate, Name}).
+
+cancel_rotation(undefined) ->
     ok;
-schedule_rotation(Name, Date) ->
-    erlang:send_after(lager_util:calculate_next_rotation(Date) * 1000, self(), {rotate, Name}),
+cancel_rotation(TimerRef) ->
+    _ = erlang:cancel_timer(TimerRef),
     ok.
+
+rotate_and_arm(File, #state{count=Count, date=Date, rotator=Rotator}=State0) ->
+    State1 = close_file(State0),
+    _ = Rotator:rotate_logfile(File, Count),
+    {ok, State1#state{rotation_timer=arm_rotation(File, Date)}}.
+
+rotate_and_maybe_arm(File, #state{rotation_timer=undefined}=State) ->
+    rotate_and_arm(File, State);
+rotate_and_maybe_arm(File, #state{count=Count, rotator=Rotator}=State0) ->
+    State1 = close_file(State0),
+    _ = Rotator:rotate_logfile(File, Count),
+    {ok, State1}.
 
 close_file(#state{fd=undefined} = State) ->
     State;
@@ -489,6 +528,39 @@ get_loglevel_test() ->
     {ok, Level2, _} = handle_call(get_loglevel,
         #state{name="foo", level=lager_util:config_to_mask(warning), fd=0, inode=0, ctime=undefined}),
     ?assertEqual(Level2, lager_util:config_to_mask(warning)).
+
+rotation_timer_ownership_test() ->
+    {ok, TestDir} = lager_util:create_test_dir(),
+    TestLog = filename:join(TestDir, "test.log"),
+    {ok, Spec} = lager_util:parse_rotation_date_spec("$D0"),
+    {ok, {FD, Inode, Ctime, _Size}} = lager_rotator_default:open_logfile(TestLog, false),
+    State0 = #state{name=TestLog, fd=FD, inode=Inode, ctime=Ctime,
+                    count=3, date=Spec, rotator=lager_rotator_default},
+    %% the first legacy rotate arms the handler's one timer
+    {ok, State1} = handle_info({rotate, TestLog}, State0),
+    Ref1 = State1#state.rotation_timer,
+    ?assert(is_reference(Ref1)),
+    %% further legacy rotates must not arm more timers
+    {ok, State2} = handle_info({rotate, TestLog}, State1),
+    ?assertEqual(Ref1, State2#state.rotation_timer),
+    {ok, ok, State3} = handle_call(rotate, State2),
+    ?assertEqual(Ref1, State3#state.rotation_timer),
+    %% the handler's own timeout re-arms exactly one new timer
+    {ok, State4} = handle_info({timeout, Ref1, {rotate, TestLog}}, State3),
+    Ref2 = State4#state.rotation_timer,
+    ?assert(is_reference(Ref2)),
+    ?assertNotEqual(Ref1, Ref2),
+    %% a timeout for a timer this handler does not own is ignored
+    {ok, State5} = handle_info({timeout, Ref1, {rotate, TestLog}}, State4),
+    ?assertEqual(Ref2, State5#state.rotation_timer),
+    %% states from before the rotation_timer field are migrated on upgrade
+    Old = erlang:delete_element(record_info(size, state), State0),
+    ?assertEqual({ok, erlang:append_element(Old, undefined)},
+                 code_change(undefined, Old, undefined)),
+    _ = erlang:cancel_timer(Ref1),
+    _ = erlang:cancel_timer(Ref2),
+    ok = lager_util:delete_test_dir(),
+    ok.
 
 rotation_test_() ->
     {foreach,

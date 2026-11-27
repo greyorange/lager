@@ -58,7 +58,10 @@
         date :: undefined | string(),
         count :: integer(),
         flap=false :: boolean(),
-        rotator :: atom()
+        rotator :: atom(),
+        %% reference of the single rotation timer owned by this process; the
+        %% timer only ever re-arms itself (see arm_rotation/1)
+        rotation_timer = undefined :: reference() | undefined
 }).
 
 %% @private
@@ -76,10 +79,10 @@ init([RelFilename, MaxBytes, Size, Date, Count, Rotator]) ->
     Filename = lager_util:expand_path(RelFilename),
     case Rotator:open_logfile(Filename, false) of
         {ok, {FD, Inode, Ctime, _Size}} ->
-            schedule_rotation(Date),
+            RotationTimer = arm_rotation(Date),
             {ok, #state{name=Filename, fd=FD, inode=Inode, ctime=Ctime,
                     fmtmaxbytes=MaxBytes, size=Size, count=Count, date=Date,
-                    rotator=Rotator}};
+                    rotator=Rotator, rotation_timer=RotationTimer}};
         {error, Reason} ->
             ?INT_LOG(error, "Failed to open crash log file ~ts with error: ~s",
                 [Filename, file:format_error(Reason)]),
@@ -102,26 +105,56 @@ handle_cast(_Request, State) ->
     {noreply, State}.
 
 %% @private
-handle_info(rotate, #state{name=Name, count=Count, date=Date, rotator=Rotator} = State) ->
-    _ = Rotator:rotate_logfile(Name, Count),
-    schedule_rotation(Date),
-    {noreply, State};
+handle_info(rotate, #state{name=Name}=State) ->
+    %% Legacy/external rotation trigger (a timer armed by an older version of
+    %% this module). Rotate, and arm a timer only if none is pending.
+    rotate_and_maybe_arm(Name, State);
+handle_info({timeout, TimerRef, rotate}, #state{rotation_timer=TimerRef}=State) ->
+    %% Our own rotation timer expired. Rotate and arm the next one.
+    rotate_and_arm(State#state.name, State);
 handle_info(_Info, State) ->
     {noreply, State}.
 
 %% @private
-terminate(_Reason, _State) ->
+terminate(_Reason, State) ->
+    cancel_rotation(State#state.rotation_timer),
     ok.
 
 %% @private
 code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+    %% States from a version before rotation_timer was added are missing the
+    %% trailing field; append it (a legacy timer, if any, re-arms itself on
+    %% expiry through the rotate clause above).
+    case erlang:tuple_size(State) =:= erlang:tuple_size(#state{}) of
+        true -> {ok, State};
+        false -> {ok, erlang:append_element(State, undefined)}
+    end.
 
-schedule_rotation(undefined) ->
+%% Arm the one rotation timer this process owns, returning its reference (or
+%% undefined when rotation by date is disabled) so the caller can store it in
+%% the process state. Using erlang:start_timer means expiry is delivered as
+%% {timeout, TimerRef, rotate}, so only this process's own timer is
+%% recognised and re-armed.
+arm_rotation(undefined) ->
+    undefined;
+arm_rotation(Date) ->
+    erlang:start_timer(lager_util:calculate_next_rotation(Date) * 1000, self(), rotate).
+
+cancel_rotation(undefined) ->
     ok;
-schedule_rotation(Date) ->
-    erlang:send_after(lager_util:calculate_next_rotation(Date) * 1000, self(), rotate),
+cancel_rotation(TimerRef) ->
+    _ = erlang:cancel_timer(TimerRef),
     ok.
+
+rotate_and_arm(Name, #state{count=Count, date=Date, rotator=Rotator}=State) ->
+    _ = Rotator:rotate_logfile(Name, Count),
+    {noreply, State#state{rotation_timer=arm_rotation(Date)}}.
+
+rotate_and_maybe_arm(Name, #state{rotation_timer=undefined}=State) ->
+    rotate_and_arm(Name, State);
+rotate_and_maybe_arm(Name, #state{count=Count, rotator=Rotator}=State) ->
+    _ = Rotator:rotate_logfile(Name, Count),
+    {noreply, State}.
 
 %% ===== Begin code lifted from riak_err =====
 
@@ -239,6 +272,28 @@ do_log({log, Event}, #state{name=Name, fd=FD, inode=Inode, ctime=Ctime, flap=Fla
 
 
 -ifdef(TEST).
+
+rotation_timer_ownership_test() ->
+    {ok, TestDir} = lager_util:create_test_dir(),
+    CrashLog = filename:join(TestDir, "crash_test.log"),
+    {ok, Spec} = lager_util:parse_rotation_date_spec("$D0"),
+    {ok, {FD, Inode, Ctime, _Size}} = lager_rotator_default:open_logfile(CrashLog, false),
+    State0 = #state{name=CrashLog, fd=FD, inode=Inode, ctime=Ctime,
+                    count=3, date=Spec, rotator=lager_rotator_default},
+    {noreply, State1} = handle_info(rotate, State0),
+    Ref1 = State1#state.rotation_timer,
+    ?assert(is_reference(Ref1)),
+    {noreply, State2} = handle_info(rotate, State1),
+    ?assertEqual(Ref1, State2#state.rotation_timer),
+    {noreply, State3} = handle_info({timeout, Ref1, rotate}, State2),
+    ?assertNotEqual(Ref1, State3#state.rotation_timer),
+    Old = erlang:delete_element(record_info(size, state), State0),
+    ?assertEqual({ok, erlang:append_element(Old, undefined)},
+                 code_change(undefined, Old, undefined)),
+    _ = erlang:cancel_timer(Ref1),
+    _ = erlang:cancel_timer(State3#state.rotation_timer),
+    ok = lager_util:delete_test_dir(),
+    ok.
 
 filesystem_test_() ->
     {foreach,
