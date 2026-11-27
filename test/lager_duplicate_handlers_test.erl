@@ -48,6 +48,14 @@ cleanup(TestDir) ->
     ok = application:stop(goldrush),
     ok = error_logger:tty(true),
     _ = catch ets:delete(async_threshold_test),
+    %% leave the lager environment as we found it; later suites start lager
+    %% with their own expectations
+    _ = application:unset_env(lager, handlers),
+    _ = application:unset_env(lager, extra_sinks),
+    _ = application:unset_env(lager, error_logger_redirect),
+    _ = application:unset_env(lager, async_threshold),
+    _ = application:unset_env(lager, crash_log),
+    _ = application:unset_env(lager, drop_if_sync),
     ok = lager_util:delete_test_dir(),
     _ = TestDir,
     ok.
